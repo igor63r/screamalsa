@@ -1,0 +1,16 @@
+config SND_SCREAMALSA
+	tristate "ScreamALSA - Virtual sound card for network streaming"
+	depends on SND
+	select SND_PCM
+	help
+	  Say Y or M if you want to add support for ScreamALSA virtual sound card.
+	  
+	  ScreamALSA creates a virtual ALSA sound card that streams audio data
+	  over network using UDP or TCP protocol. It supports both MMAP and R/W
+	  modes and sends audio packets of 1152 bytes each.
+	  
+	  To compile this driver as a module, choose M here: the module
+	  will be called snd-screamalsa.
+	  
+	  If unsure, say N.
+
