@@ -53,8 +53,16 @@
     #include <linux/sockptr.h>
 #endif
 
+/* For Audirvana and possibly some others*/
+//#define FLEXIBLE_PERIOD
+
 MODULE_AUTHOR("I.Antonov igor63r@gmail.com");
+#ifdef FLEXIBLE_PERIOD
+MODULE_VERSION("1.0.1");
+#else
 MODULE_VERSION("1.0.0");
+#endif
+
 MODULE_DESCRIPTION("ALSA driver to stream high-rate PCM/DSD over TCP/UDP (Scream protocol)");
 MODULE_LICENSE("GPL v2");
 
@@ -148,6 +156,11 @@ struct snd_scream_device {
 
     struct work_struct tx_work;
     atomic_t tx_pending;
+#ifdef FLEXIBLE_PERIOD
+    size_t alsa_period_bytes;
+    size_t bytes_in_period;
+    atomic_t periods_pending;
+#endif
 };
 
 static struct snd_pcm_hardware snd_scream_hw = {
@@ -167,7 +180,11 @@ static struct snd_pcm_hardware snd_scream_hw = {
     .channels_max = 8,
     .buffer_bytes_max = 1024 * 1024,
     .period_bytes_min = SCREAM_PAYLOAD_SIZE,
+#ifdef FLEXIBLE_PERIOD
+    .period_bytes_max = SCREAM_PAYLOAD_SIZE * 128,
+#else
     .period_bytes_max = SCREAM_PAYLOAD_SIZE,
+#endif
     .periods_min = 2,
     .periods_max = 1024,
 };
@@ -488,6 +505,9 @@ static void scream_build_payload_locked(struct snd_scream_device *dev,
 
 static void scream_tx_work(struct work_struct *work)
 {
+#ifdef FLEXIBLE_PERIOD
+    int n;
+#endif
     struct snd_scream_device *dev = container_of(work, struct snd_scream_device, tx_work);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
     struct snd_pcm_substream *sub = READ_ONCE(dev->substream);
@@ -495,7 +515,13 @@ static void scream_tx_work(struct work_struct *work)
  struct snd_pcm_substream *sub = dev->substream;
 #endif
     if (!sub) goto out;
+#ifdef FLEXIBLE_PERIOD
+    n = atomic_xchg(&dev->periods_pending, 0);
+    while (n-- > 0)
+        snd_pcm_period_elapsed(sub);
+#else
     snd_pcm_period_elapsed(sub);
+#endif
     if (dev->send) {
         if (!dev->is_tcp || atomic_read(&dev->connection_state) == STATE_CONNECTED) {
             scream_send_built_packet(dev);
@@ -533,6 +559,13 @@ static enum hrtimer_restart scream_timer_callback(struct hrtimer *timer)
          scream_build_payload_locked(dev, rt, dev->hw_ptr);
          dev->send = true;
          dev->hw_ptr = (dev->hw_ptr + SCREAM_PAYLOAD_SIZE) % buf_bytes;
+#ifdef FLEXIBLE_PERIOD
+         dev->bytes_in_period += SCREAM_PAYLOAD_SIZE;
+         while (dev->bytes_in_period >= dev->alsa_period_bytes) {
+            dev->bytes_in_period -= dev->alsa_period_bytes;
+            atomic_inc(&dev->periods_pending);
+        }
+#endif
      }
      else
          dev->send=false;
@@ -631,6 +664,7 @@ static int snd_scream_pcm_hw_params(struct snd_pcm_substream *substream, struct 
     dev->channels = params_channels(params);
     dev->format = params_format(params);
 
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0)
 #ifdef SNDRV_PCM_FORMAT_DSD_U32_BE
     dev->is_dsd = (dev->format == SNDRV_PCM_FORMAT_DSD_U32_BE);
@@ -660,8 +694,12 @@ static int snd_scream_pcm_hw_params(struct snd_pcm_substream *substream, struct 
         do_div(num, (u32)(dev->sample_rate * frame_bytes)); /* -> nanoseconds per 1152 bytes */
         dev->period_time_ns = ktime_set(0, (unsigned long)num);
     }
-
-   // pr_info(DRIVER_NAME ": hw_params set: rate=%u, channels=%u, format=%s (DSD: %s), period_time_ns=%lld\n", dev->sample_rate, dev->channels, snd_pcm_format_name(dev->format), dev->is_dsd ? "yes" : "no", ktime_to_ns(dev->period_time_ns));
+#ifdef FLEXIBLE_PERIOD
+  dev->alsa_period_bytes = params_period_size(params) * dev->channels * 4;
+  dev->bytes_in_period = 0;
+  atomic_set(&dev->periods_pending, 0);
+#endif
+    // pr_info(DRIVER_NAME ": hw_params set: rate=%u, channels=%u, format=%s (DSD: %s), period_time_ns=%lld\n", dev->sample_rate, dev->channels, snd_pcm_format_name(dev->format), dev->is_dsd ? "yes" : "no", ktime_to_ns(dev->period_time_ns));
 
     return 0;
 }
@@ -816,7 +854,11 @@ static int __init alsa_scream_driver_init(void)
     dev->substream = NULL;
     dev->is_running = false;
     dev->hw_ptr = 0;
-
+#ifdef FLEXIBLE_PERIOD
+    atomic_set(&dev->periods_pending, 0);
+    dev->bytes_in_period = 0;
+    dev->alsa_period_bytes = 0;
+#endif
     ret = snd_pcm_new(card, "Scream HQ PCM", 0, 1, 0, &pcm);
     if (ret < 0) {
         pr_err(DRIVER_NAME ": Failed to create PCM device: %d\n", ret);
