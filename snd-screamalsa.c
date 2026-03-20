@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ScreamALSA Linux Kernel Driver
  *
  * Compatibility: Linux kernel 3.8 - 6.x
@@ -14,6 +14,7 @@
  * License: GPL-2
  */
 
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -25,9 +26,15 @@
 #include <net/sock.h>
 #include <linux/inet.h>
 #include <net/tcp.h>
-#include <linux/hrtimer.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
+#include <linux/delay.h>
 #include <linux/ktime.h>
 #include <linux/version.h>
+
+#ifndef TCP_USER_TIMEOUT
+#define TCP_USER_TIMEOUT 18
+#endif
 #include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <linux/math64.h>
@@ -42,6 +49,9 @@
 #include <sound/memalloc.h>
 #include <linux/jiffies.h>
 #include <linux/fcntl.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
+#include <uapi/linux/sched/types.h>
+#endif
 
 /* Check minimum kernel version */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 0)
@@ -53,15 +63,8 @@
     #include <linux/sockptr.h>
 #endif
 
-/* For Audirvana and possibly some others*/
-//#define FLEXIBLE_PERIOD
-
 MODULE_AUTHOR("I.Antonov igor63r@gmail.com");
-#ifdef FLEXIBLE_PERIOD
-MODULE_VERSION("1.0.1");
-#else
-MODULE_VERSION("1.0.0");
-#endif
+MODULE_VERSION("2.0.0");
 
 MODULE_DESCRIPTION("ALSA driver to stream high-rate PCM/DSD over TCP/UDP (Scream protocol)");
 MODULE_LICENSE("GPL v2");
@@ -79,7 +82,7 @@ static char ip_addr_str[32] = "192.168.1.77";
 module_param_string(ip_addr_str, ip_addr_str, sizeof(ip_addr_str), 0644);
 MODULE_PARM_DESC(ip_addr_str, "Target IP address");
 
-static char protocol_str[8] = "udp"; // "udp" или "tcp"
+static char protocol_str[8] = "udp"; // "udp" or "cp"
 module_param_string(protocol_str, protocol_str, sizeof(protocol_str), 0644);
 MODULE_PARM_DESC(protocol_str, "Network protocol: 'udp' or 'tcp'");
 
@@ -108,25 +111,7 @@ static const u8 ch_mask[] = {0, 1, 3, 7, 15, 31, 63, 127, 255};
                            SNDRV_PCM_INFO_MMAP | \
                            SNDRV_PCM_INFO_MMAP_VALID)
 
-#  define SCREAM_HRTIMER_MODE HRTIMER_MODE_REL
-
-/* hrtimer init/setup - improved compatibility */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
-/* 6.15: hrtimer_setup(timer, callback, clockid, mode) */
-static inline void scream_hrtimer_setup(struct hrtimer *t,
-                                        enum hrtimer_restart (*cb)(struct hrtimer *))
-{
-    hrtimer_setup(t, cb, CLOCK_MONOTONIC, SCREAM_HRTIMER_MODE);
-}
-#else
-/* Older kernels: basic hrtimer_init */
-static inline void scream_hrtimer_setup(struct hrtimer *t,
-                                        enum hrtimer_restart (*cb)(struct hrtimer *))
-{
-    hrtimer_init(t, CLOCK_MONOTONIC, SCREAM_HRTIMER_MODE);
-    t->function = cb;
-}
-#endif
+/* HR timer logic removed, using kthread sleep instead */
 
 struct snd_scream_device {
     struct snd_card *card;
@@ -138,11 +123,11 @@ struct snd_scream_device {
     bool is_tcp;
 
     spinlock_t lock;
-    struct hrtimer timer;
+    wait_queue_head_t playback_waitq;
+    struct task_struct *playback_thread;
     ktime_t period_time_ns;
     size_t hw_ptr;          /* in bytes */
     bool is_running;
-    bool send;
     u8 network_buffer[SCREAM_PACKET_SIZE];
 
     unsigned int sample_rate;
@@ -153,14 +138,11 @@ struct snd_scream_device {
     struct delayed_work reconnect_work;
     atomic_t connection_state;
     atomic_t reconnect_attempts;
+    atomic_t closing;        /* set to 1 during close to stop reconnect rescheduling */
 
-    struct work_struct tx_work;
-    atomic_t tx_pending;
-#ifdef FLEXIBLE_PERIOD
+    /* Flexible periods natively supported */
     size_t alsa_period_bytes;
     size_t bytes_in_period;
-    atomic_t periods_pending;
-#endif
 };
 
 static struct snd_pcm_hardware snd_scream_hw = {
@@ -180,11 +162,7 @@ static struct snd_pcm_hardware snd_scream_hw = {
     .channels_max = 8,
     .buffer_bytes_max = 1024 * 1024,
     .period_bytes_min = SCREAM_PAYLOAD_SIZE,
-#ifdef FLEXIBLE_PERIOD
     .period_bytes_max = SCREAM_PAYLOAD_SIZE * 128,
-#else
-    .period_bytes_max = SCREAM_PAYLOAD_SIZE,
-#endif
     .periods_min = 2,
     .periods_max = 1024,
 };
@@ -244,35 +222,28 @@ static inline void set_sock_timeouts(struct socket *sock, unsigned int msec)
         sock_create_kern(af, type, proto, sock)
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
-static inline u64 scream_hrtimer_forward_now(struct hrtimer *t, ktime_t interval)
-{
-    return hrtimer_forward(t, ktime_get(), interval);
-}
-#define hrtimer_forward_now(t, interval) scream_hrtimer_forward_now(t, interval)
-#endif
+/* hrtimer_forward function removed */
 
 static void scream_cleanup_resources(struct snd_scream_device *dev)
 {
     unsigned long flags;
-    bool was_running = false;
+    struct task_struct *thd = NULL;
     spin_lock_irqsave(&dev->lock, flags);
     if (dev->is_running) {
-        was_running = true;
         dev->is_running = false;
     }
+    thd = dev->playback_thread;
+    dev->playback_thread = NULL;
     spin_unlock_irqrestore(&dev->lock, flags);
-    /* Cancel timer outside of spinlock to avoid deadlock */
-    if (dev->timer.function) {
-        hrtimer_cancel(&dev->timer);
+    
+    if (thd) {
+        kthread_stop(thd);
     }
-    /* Cancel work with timeout to prevent infinite blocking */
-    cancel_work_sync(&dev->tx_work);
+
     cancel_delayed_work_sync(&dev->reconnect_work);
     /* Close socket with proper TCP shutdown */
     if (dev->sock) {
         if (dev->is_tcp && atomic_read(&dev->connection_state) == STATE_CONNECTED) {
-            /* Use non-blocking shutdown to prevent hang */
             dev->sock->ops->shutdown(dev->sock, SHUT_WR);
         }
         sock_release(dev->sock);
@@ -282,7 +253,6 @@ static void scream_cleanup_resources(struct snd_scream_device *dev)
     /* Reset all state atomically */
     atomic_set(&dev->connection_state, STATE_DISCONNECTED);
     atomic_set(&dev->reconnect_attempts, 0);
-    atomic_set(&dev->tx_pending, 0);
     spin_lock_irqsave(&dev->lock, flags);
     dev->is_running = false;
     dev->substream = NULL;
@@ -297,6 +267,8 @@ static void scream_reconnect_work(struct work_struct *work)
     int ret;
     if (!dev->is_tcp)
         return;
+    if (atomic_read(&dev->closing))
+        return;
 
     pr_info("Called scream_reconnect_work.\n");
     switch (atomic_read(&dev->connection_state)) {
@@ -308,7 +280,8 @@ static void scream_reconnect_work(struct work_struct *work)
         /* Poll non-blocking connect progress without recreating the socket */
         if (!dev->sock || !dev->sock->sk) {
             atomic_set(&dev->connection_state, STATE_DISCONNECTED);
-            schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(200));
+            if (!atomic_read(&dev->closing))
+                schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(200));
             return;
         }
 
@@ -322,7 +295,8 @@ static void scream_reconnect_work(struct work_struct *work)
         if (dev->sock->sk->sk_state == TCP_SYN_SENT || dev->sock->sk->sk_state == TCP_SYN_RECV) {
             /* Still in progress; poll again soon */
             pr_debug(DRIVER_NAME ": TCP connect in progress (state=%d)\n", dev->sock->sk->sk_state);
-            schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(200));
+            if (!atomic_read(&dev->closing))
+                schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(200));
             return;
         }
         /* Connection failed (e.g., CLOSED/FIN_WAIT/ERROR). Restart from scratch. */
@@ -366,6 +340,11 @@ static void scream_reconnect_work(struct work_struct *work)
             ret = SET_SOCKOPT(dev->sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
             if (ret < 0)
                 pr_warn(DRIVER_NAME ": Failed to set SO_KEEPALIVE: %d\n", ret);
+
+            opt = 3000;
+            ret = SET_SOCKOPT(dev->sock, SOL_TCP, TCP_USER_TIMEOUT, &opt, sizeof(opt));
+            if (ret < 0)
+                pr_warn(DRIVER_NAME ": Failed to set TCP_USER_TIMEOUT: %d\n", ret);
         }
         /* Start non-blocking connect and keep socket for polling */
         ret = kernel_connect(dev->sock, (struct sockaddr *)&dev->remote_addr,
@@ -381,7 +360,8 @@ static void scream_reconnect_work(struct work_struct *work)
             /* Connection in progress, keep state and poll soon */
             pr_debug(DRIVER_NAME ": TCP connect started (non-blocking).\n");
             atomic_set(&dev->connection_state, STATE_CONNECTING);
-            schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(200));
+            if (!atomic_read(&dev->closing))
+                schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(200));
             return;
         }
         pr_warn(DRIVER_NAME ": Reconnect attempt failed immediately: %d\n", ret);
@@ -393,7 +373,8 @@ static void scream_reconnect_work(struct work_struct *work)
     }
 retry_long:
     atomic_set(&dev->connection_state, STATE_DISCONNECTED);
-    schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(2000));
+    if (!atomic_read(&dev->closing))
+        schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(2000));
 }
 
 static unsigned int scream_reconnect_delay_ms_for_err(int err)
@@ -413,50 +394,6 @@ static unsigned int scream_reconnect_delay_ms_for_err(int err)
     default:
         return 500;
     }
-}
-
-static int scream_send_built_packet(struct snd_scream_device *dev)
-{
-    struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
-    struct kvec iov;
-    int ret = 0;
-
-    iov.iov_base = dev->network_buffer;
-    iov.iov_len = SCREAM_PACKET_SIZE;
-
-    if (dev->is_tcp) {
-        unsigned long flags;
-        if (atomic_read(&dev->connection_state) != STATE_CONNECTED)
-            {
-             pr_warn(DRIVER_NAME ": No TCP connection.\n");
-            return -ENOTCONN;
-            }
-
-        spin_lock_irqsave(&dev->lock, flags);
-        if (!dev->is_running) {
-            spin_unlock_irqrestore(&dev->lock, flags);
-            return -EINTR;
-        }
-        spin_unlock_irqrestore(&dev->lock, flags);
-        ret = kernel_sendmsg(dev->sock, &msg, &iov, 1, SCREAM_PACKET_SIZE);
-        if (ret < 0) {
-            if (ret == -EAGAIN || ret == -ENOBUFS) { }
-            else
-              if (ret == -EPIPE || ret == -ECONNRESET || ret == -ESHUTDOWN ||
-               ret == -ETIMEDOUT || ret == -ENOTCONN ||
-               ret == -ENETUNREACH || ret == -EHOSTUNREACH || ret == -EADDRNOTAVAIL) {
-                unsigned int delay = scream_reconnect_delay_ms_for_err(ret);
-                if (atomic_cmpxchg(&dev->connection_state, STATE_CONNECTED, STATE_DISCONNECTED) == STATE_CONNECTED) {
-                    schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(delay));
-                }
-            }
-        }
-    } else {
-        msg.msg_name = &dev->remote_addr;
-        msg.msg_namelen = sizeof(dev->remote_addr);
-        ret = kernel_sendmsg(dev->sock, &msg, &iov, 1, SCREAM_PACKET_SIZE);
-    }
-    return ret;
 }
 
 static u8 lastbuf[SCREAM_HEADER_SIZE + SCREAM_PAYLOAD_SIZE] = {0};
@@ -487,10 +424,10 @@ static int scream_send_last_packet(struct snd_scream_device *dev)
 
 static void scream_build_payload_locked(struct snd_scream_device *dev,
                                         struct snd_pcm_runtime *runtime,
-                                        size_t current_hw_ptr)
+                                        size_t current_hw_ptr,
+                                        void *data)
 {
     size_t buffer_size =runtime->buffer_size*4*dev->channels;
-    void* data = (void*)(dev->network_buffer + SCREAM_HEADER_SIZE);
     if (current_hw_ptr + SCREAM_PAYLOAD_SIZE > buffer_size) {
         size_t len1 = buffer_size - current_hw_ptr;
         size_t len2 = SCREAM_PAYLOAD_SIZE - len1;
@@ -503,78 +440,126 @@ static void scream_build_payload_locked(struct snd_scream_device *dev,
         convert_data(data, SCREAM_PAYLOAD_SIZE/8);
 }
 
-static void scream_tx_work(struct work_struct *work)
+static int scream_playback_thread(void *data)
 {
-#ifdef FLEXIBLE_PERIOD
-    int n;
-#endif
-    struct snd_scream_device *dev = container_of(work, struct snd_scream_device, tx_work);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
-    struct snd_pcm_substream *sub = READ_ONCE(dev->substream);
-#else
- struct snd_pcm_substream *sub = dev->substream;
-#endif
-    if (!sub) goto out;
-#ifdef FLEXIBLE_PERIOD
-    n = atomic_xchg(&dev->periods_pending, 0);
-    while (n-- > 0)
-        snd_pcm_period_elapsed(sub);
-#else
-    snd_pcm_period_elapsed(sub);
-#endif
-    if (dev->send) {
-        if (!dev->is_tcp || atomic_read(&dev->connection_state) == STATE_CONNECTED) {
-            scream_send_built_packet(dev);
-        }
-    }
-out:
-    atomic_set(&dev->tx_pending, 0);
-}
+    struct snd_scream_device *dev = data;
+    struct snd_pcm_substream *sub;
+    struct snd_pcm_runtime *rt;
+    ktime_t next_wake;
+    bool is_first_packet;
 
-static enum hrtimer_restart scream_timer_callback(struct hrtimer *timer)
-{
-    struct snd_scream_device *dev = container_of(timer, struct snd_scream_device, timer);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
-    struct snd_pcm_substream *sub = READ_ONCE(dev->substream);
+    /* Set realtime priority SCHED_FIFO 50 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+    sched_set_fifo(current);
 #else
-  struct snd_pcm_substream *sub = dev->substream;
+    struct sched_param param = { .sched_priority = 50 };
+    sched_setscheduler(current, SCHED_FIFO, &param);
 #endif
-    unsigned long flags;
-    spin_lock_irqsave(&dev->lock, flags);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
-    if (!READ_ONCE(dev->is_running))
-#else
-    if (!dev->is_running)
-#endif
-    {
-        spin_unlock_irqrestore(&dev->lock, flags);
-        return HRTIMER_NORESTART;
-    }
-    {
-     struct snd_pcm_runtime *rt = sub->runtime;
-     snd_pcm_sframes_t avail_fr = snd_pcm_playback_hw_avail(rt);
-     if (avail_fr < 0) avail_fr = 0;
-     if (avail_fr * 4 * dev->channels >= SCREAM_PAYLOAD_SIZE) {
-         size_t buf_bytes = sub->runtime->buffer_size* 4 * dev->channels;
-         scream_build_payload_locked(dev, rt, dev->hw_ptr);
-         dev->send = true;
-         dev->hw_ptr = (dev->hw_ptr + SCREAM_PAYLOAD_SIZE) % buf_bytes;
-#ifdef FLEXIBLE_PERIOD
-         dev->bytes_in_period += SCREAM_PAYLOAD_SIZE;
-         while (dev->bytes_in_period >= dev->alsa_period_bytes) {
-            dev->bytes_in_period -= dev->alsa_period_bytes;
-            atomic_inc(&dev->periods_pending);
+
+    while (!kthread_should_stop()) {
+        wait_event_interruptible(dev->playback_waitq, kthread_should_stop() || dev->is_running);
+        
+        if (kthread_should_stop())
+            break;
+
+        is_first_packet = true;
+        next_wake = ktime_get();
+
+        while (!kthread_should_stop()) {
+            unsigned long flags;
+            snd_pcm_sframes_t avail_fr;
+            bool do_send = false;
+
+            spin_lock_irqsave(&dev->lock, flags);
+        if (!dev->is_running) {
+            spin_unlock_irqrestore(&dev->lock, flags);
+            break;
         }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+        sub = READ_ONCE(dev->substream);
+#else
+        sub = dev->substream;
 #endif
-     }
-     else
-         dev->send=false;
-     spin_unlock_irqrestore(&dev->lock, flags);
-     if (atomic_cmpxchg(&dev->tx_pending, 0, 1) == 0)
-         schedule_work(&dev->tx_work);
-     hrtimer_forward_now(&dev->timer, dev->period_time_ns);
+        if (!sub) {
+            spin_unlock_irqrestore(&dev->lock, flags);
+            usleep_range(1000, 2000);
+            continue;
+        }
+
+        rt = sub->runtime;
+        avail_fr = snd_pcm_playback_hw_avail(rt);
+        if (avail_fr < 0) avail_fr = 0;
+
+        if (avail_fr * 4 * dev->channels >= SCREAM_PAYLOAD_SIZE) {
+            size_t buf_bytes = rt->buffer_size * 4 * dev->channels;
+            
+            scream_build_payload_locked(dev, rt, dev->hw_ptr,
+                                        dev->network_buffer + SCREAM_HEADER_SIZE);
+            dev->hw_ptr = (dev->hw_ptr + SCREAM_PAYLOAD_SIZE) % buf_bytes;
+            
+            do_send = true;
+        }
+        spin_unlock_irqrestore(&dev->lock, flags);
+
+        if (do_send) {
+            if (!dev->is_tcp || atomic_read(&dev->connection_state) == STATE_CONNECTED) {
+                struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
+                struct kvec iov = { .iov_base = dev->network_buffer, .iov_len = SCREAM_PACKET_SIZE };
+                int ret;
+                if (!dev->is_tcp) {
+                    msg.msg_name = &dev->remote_addr;
+                    msg.msg_namelen = sizeof(dev->remote_addr);
+                }
+                ret = kernel_sendmsg(dev->sock, &msg, &iov, 1, SCREAM_PACKET_SIZE);
+                if (ret < 0 && dev->is_tcp) {
+                    if (ret != -EAGAIN && ret != -ENOBUFS) {
+                        unsigned int delay = scream_reconnect_delay_ms_for_err(ret);
+                        if (atomic_cmpxchg(&dev->connection_state, STATE_CONNECTED, STATE_DISCONNECTED) == STATE_CONNECTED) {
+                            if (!atomic_read(&dev->closing))
+                                schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(delay));
+                        }
+                    }
+                } else if (dev->is_tcp && ret != SCREAM_PACKET_SIZE) {
+                    /* Force reconnect on partial send to prevent receiver desync */
+                    if (atomic_cmpxchg(&dev->connection_state, STATE_CONNECTED, STATE_DISCONNECTED) == STATE_CONNECTED) {
+                        if (!atomic_read(&dev->closing))
+                            schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(100));
+                    }
+                }
+            }
+            
+            /* Handle ALSA period elapsed natively */
+            dev->bytes_in_period += SCREAM_PAYLOAD_SIZE;
+            if (dev->bytes_in_period >= dev->alsa_period_bytes) {
+                dev->bytes_in_period -= dev->alsa_period_bytes;
+                snd_pcm_period_elapsed(sub);
+            }
+
+            /* Wait precisely for the next packet interval */
+            if (is_first_packet) {
+                next_wake = ktime_get();
+                is_first_packet = false;
+            } else {
+                next_wake = ktime_add(next_wake, dev->period_time_ns);
+                
+                /* Catch up if we are severely behind */
+                if (ktime_compare(ktime_get(), next_wake) > 0) {
+                     next_wake = ktime_get();
+                } else {
+                     set_current_state(TASK_INTERRUPTIBLE);
+                     schedule_hrtimeout(&next_wake, HRTIMER_MODE_ABS);
+                }
+            }
+
+        } else {
+            /* No data available, sleep lightly to avoid CPU burn */
+            usleep_range(200, 500);
+            next_wake = ktime_get(); /* reset timeline after underrun */
+        }
     }
-    return HRTIMER_RESTART;
+    }
+    return 0;
 }
 
 static int snd_scream_pcm_open(struct snd_pcm_substream *substream)
@@ -583,12 +568,31 @@ static int snd_scream_pcm_open(struct snd_pcm_substream *substream)
     struct snd_pcm_runtime *runtime = substream->runtime;
     int ret;
 
+    atomic_set(&dev->closing, 0);
     dev->substream = substream;
     runtime->hw = snd_scream_hw;
     ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
     if (ret < 0)
         return ret;
     dev->is_tcp = sysfs_streq(protocol_str, "tcp");
+
+    /* Reuse existing socket for seamless track switching */
+    if (dev->sock) {
+        if (dev->is_tcp &&
+            atomic_read(&dev->connection_state) != STATE_DISCONNECTED)
+            return 0;  /* TCP connected/connecting - reuse */
+        if (!dev->is_tcp)
+            return 0;  /* UDP - always reuse */
+
+        /* TCP disconnected - clean up stale socket */
+        atomic_set(&dev->closing, 1);
+        cancel_delayed_work_sync(&dev->reconnect_work);
+        sock_release(dev->sock);
+        dev->sock = NULL;
+        atomic_set(&dev->connection_state, STATE_DISCONNECTED);
+        atomic_set(&dev->reconnect_attempts, 0);
+        atomic_set(&dev->closing, 0);
+    }
 
     ret = SCREAM_SOCK_CREATE(AF_INET,
                            dev->is_tcp ? SOCK_STREAM : SOCK_DGRAM,
@@ -609,13 +613,21 @@ static int snd_scream_pcm_open(struct snd_pcm_substream *substream)
             SET_SOCKOPT(dev->sock, SOL_TCP, TCP_NODELAY, (char *)&opt, sizeof(opt));
             opt = 1;
             SET_SOCKOPT(dev->sock, SOL_SOCKET, SO_KEEPALIVE, (char *)&opt, sizeof(opt));
+            opt = 3000;
+            SET_SOCKOPT(dev->sock, SOL_TCP, TCP_USER_TIMEOUT, (char *)&opt, sizeof(opt));
         }
-        /* Only schedule reconnect if not already connected */
-        if (atomic_read(&dev->connection_state) == STATE_DISCONNECTED) {
-            schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(100));
-        }
+        schedule_delayed_work(&dev->reconnect_work, msecs_to_jiffies(100));
     } else {
         atomic_set(&dev->connection_state, STATE_CONNECTED);
+    }
+
+    if (!dev->playback_thread) {
+        dev->playback_thread = kthread_run(scream_playback_thread, dev, "scream_tx");
+        if (IS_ERR(dev->playback_thread)) {
+            pr_err(DRIVER_NAME ": Failed to create playback thread\n");
+            dev->playback_thread = NULL;
+            return -ENOMEM;
+        }
     }
 
     return 0;
@@ -625,28 +637,30 @@ static int snd_scream_pcm_close(struct snd_pcm_substream *substream)
 {
     struct snd_scream_device *dev = snd_pcm_substream_chip(substream);
     unsigned long flags;
+    struct task_struct *thd = NULL;
 
     /* Stop playback first if still running */
     spin_lock_irqsave(&dev->lock, flags);
     if (dev->is_running) {
         dev->is_running = false;
-        spin_unlock_irqrestore(&dev->lock, flags);
+        thd = dev->playback_thread;
+        dev->playback_thread = NULL;
+    }
+    spin_unlock_irqrestore(&dev->lock, flags);
 
-        /* Cancel timer and work outside of spinlock */
-        hrtimer_cancel(&dev->timer);
-        cancel_work_sync(&dev->tx_work);
-        atomic_set(&dev->tx_pending, 0);
-    } else {
-        spin_unlock_irqrestore(&dev->lock, flags);
+    if (thd) {
+        kthread_stop(thd);
     }
 
-    /* Send last packet if socket exists and connected */
+    /* Send end-of-track marker */
     if (dev->sock && atomic_read(&dev->connection_state) == STATE_CONNECTED) {
         scream_send_last_packet(dev);
     }
 
-    /* Clean up all resources */
-    scream_cleanup_resources(dev);
+    /* Keep socket alive for seamless track switching */
+    spin_lock_irqsave(&dev->lock, flags);
+    dev->substream = NULL;
+    spin_unlock_irqrestore(&dev->lock, flags);
     return 0;
 }
 
@@ -688,18 +702,15 @@ static int snd_scream_pcm_hw_params(struct snd_pcm_substream *substream, struct 
     dev->network_buffer[2] = (u8)dev->channels;
     dev->network_buffer[3] = ch_mask[dev->channels];
     dev->network_buffer[4] = 0;
-    {
-        unsigned int frame_bytes = (snd_pcm_format_physical_width(dev->format) / 8) * dev->channels;
-        u64 num = (u64)SCREAM_PAYLOAD_SIZE * 1000000000ULL; /* bytes * 1e9 */
-        do_div(num, (u32)(dev->sample_rate * frame_bytes)); /* -> nanoseconds per 1152 bytes */
-        dev->period_time_ns = ktime_set(0, (unsigned long)num);
-    }
-#ifdef FLEXIBLE_PERIOD
-  dev->alsa_period_bytes = params_period_size(params) * dev->channels * 4;
-  dev->bytes_in_period = 0;
-  atomic_set(&dev->periods_pending, 0);
-#endif
-    // pr_info(DRIVER_NAME ": hw_params set: rate=%u, channels=%u, format=%s (DSD: %s), period_time_ns=%lld\n", dev->sample_rate, dev->channels, snd_pcm_format_name(dev->format), dev->is_dsd ? "yes" : "no", ktime_to_ns(dev->period_time_ns));
+     {
+         unsigned int frame_bytes = (snd_pcm_format_physical_width(dev->format) / 8) * dev->channels;
+         u64 num = (u64)SCREAM_PAYLOAD_SIZE * 1000000000ULL; /* bytes * 1e9 */
+         do_div(num, (u32)(dev->sample_rate * frame_bytes)); /* -> nanoseconds per 1152 bytes */
+         dev->period_time_ns = ktime_set(0, (unsigned long)num);
+     }
+     
+     dev->alsa_period_bytes = params_period_size(params) * dev->channels * 4;
+     dev->bytes_in_period = 0;
 
     return 0;
 }
@@ -717,28 +728,26 @@ static int snd_scream_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
     struct snd_scream_device *dev = snd_pcm_substream_chip(substream);
     unsigned long flags;
-    bool was_running = false;
 
-    spin_lock_irqsave(&dev->lock, flags);
     switch (cmd) {
     case SNDRV_PCM_TRIGGER_START:
+        spin_lock_irqsave(&dev->lock, flags);
         if (!dev->is_running) {
-            atomic_set(&dev->tx_pending, 0);
             dev->is_running = true;
-            hrtimer_start(&dev->timer, dev->period_time_ns, SCREAM_HRTIMER_MODE);
+            wake_up_interruptible(&dev->playback_waitq);
         }
+        spin_unlock_irqrestore(&dev->lock, flags);
         break;
     case SNDRV_PCM_TRIGGER_STOP:
+        spin_lock_irqsave(&dev->lock, flags);
         if (dev->is_running) {
-            was_running = true;
             dev->is_running = false;
         }
+        spin_unlock_irqrestore(&dev->lock, flags);
         break;
     default:
-        spin_unlock_irqrestore(&dev->lock, flags);
         return -EINVAL;
     }
-    spin_unlock_irqrestore(&dev->lock, flags);
     return 0;
 }
 
@@ -834,6 +843,7 @@ static int __init alsa_scream_driver_init(void)
         scream_pdev = NULL;
         return -ENOMEM;
     }
+
     card->private_data = dev;
     strcpy(card->driver, DRIVER_NAME);
     strcpy(card->shortname, "ScreamALSA (Network)");
@@ -844,21 +854,19 @@ static int __init alsa_scream_driver_init(void)
 
     dev->card = card;
     spin_lock_init(&dev->lock);
-    scream_hrtimer_setup(&dev->timer, scream_timer_callback);
+    init_waitqueue_head(&dev->playback_waitq);
     INIT_DELAYED_WORK(&dev->reconnect_work, scream_reconnect_work);
     atomic_set(&dev->connection_state, STATE_DISCONNECTED);
     atomic_set(&dev->reconnect_attempts, 0);
-    INIT_WORK(&dev->tx_work, scream_tx_work);
-    atomic_set(&dev->tx_pending, 0);
+    atomic_set(&dev->closing, 0);
     dev->sock = NULL;
     dev->substream = NULL;
     dev->is_running = false;
     dev->hw_ptr = 0;
-#ifdef FLEXIBLE_PERIOD
-    atomic_set(&dev->periods_pending, 0);
+    dev->playback_thread = NULL;
     dev->bytes_in_period = 0;
     dev->alsa_period_bytes = 0;
-#endif
+
     ret = snd_pcm_new(card, "Scream HQ PCM", 0, 1, 0, &pcm);
     if (ret < 0) {
         pr_err(DRIVER_NAME ": Failed to create PCM device: %d\n", ret);
@@ -897,19 +905,20 @@ static void __exit alsa_scream_driver_exit(void)
         if (dev) {
             /* Stop playback first if running */
             unsigned long flags;
+            struct task_struct *thd = NULL;
             spin_lock_irqsave(&dev->lock, flags);
             if (dev->is_running) {
                 dev->is_running = false;
-                spin_unlock_irqrestore(&dev->lock, flags);
-
-                /* Cancel timer and work outside of spinlock */
-                hrtimer_cancel(&dev->timer);
-                cancel_work_sync(&dev->tx_work);
-                cancel_delayed_work_sync(&dev->reconnect_work);
-                atomic_set(&dev->tx_pending, 0);
-            } else {
-                spin_unlock_irqrestore(&dev->lock, flags);
+                thd = dev->playback_thread;
+                dev->playback_thread = NULL;
             }
+            spin_unlock_irqrestore(&dev->lock, flags);
+            
+            if (thd) {
+                kthread_stop(thd);
+            }
+            
+            cancel_delayed_work_sync(&dev->reconnect_work);
 
             scream_cleanup_resources(dev);
             kfree(dev);
